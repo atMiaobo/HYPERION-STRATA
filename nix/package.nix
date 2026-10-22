@@ -12,6 +12,7 @@
 , mpv-unwrapped
 , gtk4
 , python3
+, tzdata
 }:
 
 let
@@ -19,7 +20,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "hyperion-rain";
-  version = "0.2.0";
+  version = "0.3.0";
 
   src = lib.cleanSource ../.;
 
@@ -45,12 +46,23 @@ stdenv.mkDerivation {
 
   # Pin the GUI interpreter and its PyGObject module to the same Python.
   postPatch = ''
-    substituteInPlace gui/hyperion-rain.py \
+    substituteInPlace gui/hyperion-rain.py controller/hyperion-cadere.py \
       --replace-fail '#!/usr/bin/env python3' '#!${python}/bin/python3'
   '';
 
+  preFixup = ''
+    gappsWrapperArgs+=(--prefix PATH : "$out/bin" --set PYTHONTZPATH "${tzdata}/share/zoneinfo")
+  '';
+
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    PYTHONDONTWRITEBYTECODE=1 PYTHONTZPATH=${tzdata}/share/zoneinfo ${python}/bin/python3 -m unittest discover -s ../tests -v
+    runHook postCheck
+  '';
+
   meta = {
-    description = "Wayland shader effects overlay with a GTK4 control panel";
+    description = "Composable Wayland effects, weather controller and GTK4 control panel";
     homepage = "https://nyabi.org";
     license = lib.licenses.mit;
     platforms = lib.platforms.linux;

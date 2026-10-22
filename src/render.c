@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,7 @@ static const char *frag_header =
 	"uniform sampler2D iChannel2;\n"
 	"uniform sampler2D iChannel3;\n"
 	"uniform float uOpacity;\n"
+    "uniform float uQuality;\n"
 	"out vec4 overlay_FragColor;\n";
 
 /*
@@ -89,7 +91,9 @@ static char *read_file(const char *path)
 	fseek(f, 0, SEEK_END);
 	long len = ftell(f);
 	fseek(f, 0, SEEK_SET);
+	if (len < 0 || len > 1048576) { fclose(f); return NULL; }
 	char *buf = malloc(len + 1);
+    if (!buf) { fclose(f); return NULL; }
 	if (fread(buf, 1, len, f) != (size_t)len) {
 		free(buf);
 		fclose(f);
@@ -111,11 +115,19 @@ static struct param *param_find(struct overlay *ov, const char *name)
 static struct param *param_add(struct overlay *ov, const char *name)
 {
 	struct param *p = param_find(ov, name);
-	if (p || ov->n_params == MAX_PARAMS)
-		return p;
+	if (p || ov->n_params >= PARAM_LIMIT || strlen(name) >= sizeof p->name)
+        return p;
+    if (ov->n_params == ov->params_capacity) {
+        int cap = ov->params_capacity ? ov->params_capacity * 2 : 32;
+        struct param *next = realloc(ov->params, cap * sizeof *next);
+        if (!next) return NULL;
+        ov->params = next;
+        ov->params_capacity = cap;
+    }
 	p = &ov->params[ov->n_params++];
 	memset(p, 0, sizeof *p);
 	snprintf(p->name, sizeof p->name, "%s", name);
+    p->location = ov->program ? glGetUniformLocation(ov->program, name) : -1;
 	return p;
 }
 
@@ -128,7 +140,8 @@ float param_get(struct overlay *ov, const char *name, float fallback)
 /* Runtime (IPC) override. Sticks across shader reloads. */
 void param_set(struct overlay *ov, const char *name, float value)
 {
-	struct param *p = param_add(ov, name);
+	if (!isfinite(value) || fabsf(value) > 1000000) return;
+    struct param *p = param_add(ov, name);
 	if (!p)
 		return;
 	p->value = value;
@@ -149,7 +162,8 @@ static void preprocess(struct overlay *ov, char *src)
 		while (*s == ' ' || *s == '\t')
 			s++;
 
-		if (strncmp(s, "#version", 8) == 0) {
+		if (strncmp(s, "#pragma static", 14) == 0) ov->static_shader = true;
+        if (strncmp(s, "#version", 8) == 0) {
 			for (char *c = line; c < (next ? next : line + strlen(line)); c++)
 				*c = ' ';
 		} else if (strncmp(s, "#pragma sound", 13) == 0) {
@@ -170,7 +184,7 @@ static void preprocess(struct overlay *ov, char *src)
 		} else if (strncmp(s, "#pragma param", 13) == 0) {
 			char name[64];
 			float def;
-			if (sscanf(s + 13, " %63s %f", name, &def) == 2) {
+			if (sscanf(s + 13, " %63s %f", name, &def) == 2 && isfinite(def)) {
 				struct param *p = param_add(ov, name);
 				if (p && !p->overridden)
 					p->value = def;
@@ -180,6 +194,18 @@ static void preprocess(struct overlay *ov, char *src)
 	}
 }
 
+/* Compiled source cache, shared by every layer in this EGL context. */
+struct cached_program { GLuint program; uint64_t hash; unsigned refs; char path[4096]; };
+static struct cached_program programs[LAYER_LIMIT + 4];
+void shader_release(GLuint program) {
+    if (!program) return;
+    for (unsigned i = 0; i < sizeof programs/sizeof *programs; i++) {
+        if (programs[i].program != program) continue;
+        if (--programs[i].refs == 0) { glDeleteProgram(program); programs[i].program = 0; }
+        return;
+    }
+    glDeleteProgram(program); /* native validation programs are not cached */
+}
 bool shader_load(struct overlay *ov, const char *path)
 {
 	char *src = read_file(path);
@@ -187,22 +213,27 @@ bool shader_load(struct overlay *ov, const char *path)
 		fprintf(stderr, "gl-overlay: cannot read shader '%s'\n", path);
 		return false;
 	}
-	/* Another effect: start from its own defaults, so e.g. rain's uWind
-	 * doesn't carry over into snow. Reloading the same file keeps them. */
-	bool switching = ov->program && strcmp(path, ov->shader_path) != 0;
-	struct param saved[MAX_PARAMS];
-	int n_saved = ov->n_params;
-	if (switching) {
-		memcpy(saved, ov->params, sizeof saved);
-		ov->n_params = 0;
-	}
-	char saved_sound[64], saved_follow[64], saved_step[64];
-	memcpy(saved_sound, ov->sound_effect, sizeof saved_sound);
-	memcpy(saved_follow, ov->sound_follow, sizeof saved_follow);
-	memcpy(saved_step, ov->step_follow, sizeof saved_step);
-	ov->sound_effect[0] = ov->sound_follow[0] = ov->step_follow[0] = '\0';
-	preprocess(ov, src);
+    uint64_t source_hash = 1469598103934665603ULL;
+    for (const unsigned char *c = (unsigned char *)src; *c; c++) source_hash = (source_hash ^ *c) * 1099511628211ULL;
+    struct cached_program *cached = NULL, *empty = NULL;
+    for (unsigned i = 0; i < sizeof programs/sizeof *programs; i++) {
+        if (!programs[i].program) empty = &programs[i];
+        else if (programs[i].hash == source_hash && !strcmp(programs[i].path, path)) cached = &programs[i];
+    }
+    /* Parse into a separate candidate: compile failure preserves all old state. */
+    struct overlay candidate = *ov;
+    candidate.params = calloc(PARAM_LIMIT, sizeof *candidate.params);
+    if (!candidate.params) { free(src); return false; }
+    candidate.params_capacity = PARAM_LIMIT;
+    bool switching = ov->program && strcmp(path, ov->shader_path) != 0;
+    candidate.n_params = switching ? 0 : ov->n_params;
+    if (candidate.n_params) memcpy(candidate.params, ov->params, candidate.n_params * sizeof *candidate.params);
+    candidate.sound_effect[0] = candidate.sound_follow[0] = candidate.step_follow[0] = '\0';
+    candidate.static_shader = false;
+    preprocess(&candidate, src);
 
+    GLuint prog;
+    if (cached) { prog = cached->program; cached->refs++; free(src); goto linked; }
 	const char *frag_srcs[] = { frag_header, "#line 1\n", src, frag_footer };
 	GLuint vs = compile(GL_VERTEX_SHADER, &vert_src, 1);
 	GLuint fs = compile(GL_FRAGMENT_SHADER, frag_srcs, 4);
@@ -213,7 +244,7 @@ bool shader_load(struct overlay *ov, const char *path)
 		goto fail; /* keep the previous program running */
 	}
 
-	GLuint prog = glCreateProgram();
+	prog = glCreateProgram();
 	glAttachShader(prog, vs);
 	glAttachShader(prog, fs);
 	glLinkProgram(prog);
@@ -230,24 +261,25 @@ bool shader_load(struct overlay *ov, const char *path)
 		goto fail;
 	}
 
-	if (ov->program)
-		glDeleteProgram(ov->program);
-	ov->program = prog;
-	if (path != ov->shader_path)
-		snprintf(ov->shader_path, sizeof ov->shader_path, "%s", path);
-	ov->frame = 0;
-	fprintf(stderr, "gl-overlay: loaded %s\n", path);
-	return true;
-
+    if (empty) {
+        empty->program = prog; empty->hash = source_hash; empty->refs = 1;
+        snprintf(empty->path, sizeof empty->path, "%s", path);
+    }
+linked:
+    if (ov->program) shader_release(ov->program);
+    free(ov->params);
+    candidate.program = prog;
+    candidate.locations_cached = false;
+    *ov = candidate;
+    for (int i = 0; i < ov->n_params; i++)
+        ov->params[i].location = glGetUniformLocation(prog, ov->params[i].name);
+    if (path != ov->shader_path) snprintf(ov->shader_path, sizeof ov->shader_path, "%s", path);
+    ov->frame = 0;
+    fprintf(stderr, "gl-overlay: loaded %s\n", path);
+    return true;
 fail:
-	if (switching) {
-		memcpy(ov->params, saved, sizeof saved);
-		ov->n_params = n_saved;
-	}
-	memcpy(ov->sound_effect, saved_sound, sizeof saved_sound);
-	memcpy(ov->sound_follow, saved_follow, sizeof saved_follow);
-	memcpy(ov->step_follow, saved_step, sizeof saved_step);
-	return false;
+    free(candidate.params);
+    return false;
 }
 
 /* Where effects live, first match wins: the source tree (when run from it),
@@ -340,6 +372,7 @@ static GLuint make_noise(int size, uint32_t seed)
 /* headless: no Wayland, render into an FBO (used by gl-overlay-still). */
 bool gl_init(struct overlay *ov, bool headless)
 {
+    ov->base_opacity = 1;
 	ov->egl_display = headless
 		? eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL)
 		: eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, ov->display, NULL);
@@ -387,9 +420,12 @@ void gl_finish(struct overlay *ov)
 		return;
 	if (ov->egl_context) {
 		eglMakeCurrent(ov->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, ov->egl_context);
-		if (ov->program)
-			glDeleteProgram(ov->program);
+		if (ov->program) shader_release(ov->program);
+        free(ov->params); ov->params = NULL;
+        for (int i = 0; i < ov->n_layers; i++) layer_free(ov->layers[i]);
+        free(ov->layers); ov->layers = NULL; ov->n_layers = 0;
 		glDeleteTextures(4, ov->channels);
+        if (ov->native_texture) glDeleteTextures(1, &ov->native_texture);
 		glDeleteVertexArrays(1, &ov->vao);
 		eglMakeCurrent(ov->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 		eglDestroyContext(ov->egl_display, ov->egl_context);
@@ -417,41 +453,52 @@ void output_render(struct overlay *ov, struct output *out)
 	out->render_time = ov->time;
 
 	eglMakeCurrent(ov->egl_display, out->egl_surface, out->egl_surface, ov->egl_context);
-	draw_frame(ov, out->width * out->scale, out->height * out->scale, dt);
+	ov->render_output = out->name;
+    float opacity = ov->opacity;
+    ov->opacity *= out->output_opacity;
+    bool visible = ov->visible;
+    ov->visible = visible && !out->disabled;
+    double begin = now_seconds();
+    draw_frame(ov, out->buffer_width, out->buffer_height, dt);
+    ov->cpu_frame_ms = (now_seconds() - begin) * 1000.0;
+    ov->opacity = opacity; ov->visible = visible;
 
 	sound_update(ov, false);
 
 	/* Request the next frame *before* swapping (swap commits the surface). */
-	if (!ov->paused && ov->visible)
+	if (!ov->paused && ov->visible && !out->disabled && out->output_opacity > 0 && engine_animated(ov, out->name))
 		output_request_frame(out);
 	eglSwapBuffers(ov->egl_display, out->egl_surface);
 }
 
 /* Draw one frame of the active shader into the current framebuffer. */
-void draw_frame(struct overlay *ov, int w, int h, double dt)
+static void draw_program(struct overlay *ov, int w, int h, double dt)
 {
-	glViewport(0, 0, w, h);
-	glClearColor(0, 0, 0, 0);
-	glClear(GL_COLOR_BUFFER_BIT);
 
 	if (ov->visible && ov->program) {
 		GLuint p = ov->program;
+        if (!ov->locations_cached) {
+            static const char *names[] = {"iResolution","iTime","iTimeDelta","iFrame","iMouse","uOpacity","iDate","iChannel0","iChannel1","iChannel2","iChannel3","iChannelResolution","uQuality"};
+            for (int i = 0; i < 13; i++) ov->uniforms[i] = glGetUniformLocation(p, names[i]);
+            ov->locations_cached = true;
+        }
 		glUseProgram(p);
+        glUniform1f(ov->uniforms[12], ov->quality > 0 ? ov->quality : 1.0f);
 
-		glUniform3f(glGetUniformLocation(p, "iResolution"), w, h, 1.0f);
-		glUniform1f(glGetUniformLocation(p, "iTime"), (float)ov->time);
-		glUniform1f(glGetUniformLocation(p, "iTimeDelta"), (float)dt);
-		glUniform1i(glGetUniformLocation(p, "iFrame"), ov->frame);
+		glUniform3f(ov->uniforms[0], w, h, 1.0f);
+		glUniform1f(ov->uniforms[1], (float)(ov->frozen ? ov->frozen_time : ov->time - ov->time_offset));
+		glUniform1f(ov->uniforms[2], (float)dt);
+		glUniform1i(ov->uniforms[3], ov->frame);
 		/* We take no input, so there is no pointer; scripts can drive it via IPC. */
 		struct param *mx = param_find(ov, "iMouse.x"), *my = param_find(ov, "iMouse.y");
-		glUniform4f(glGetUniformLocation(p, "iMouse"),
+		glUniform4f(ov->uniforms[4],
 		            mx ? mx->value : 0, my ? my->value : 0, 0, 0);
-		glUniform1f(glGetUniformLocation(p, "uOpacity"), ov->opacity);
+		glUniform1f(ov->uniforms[5], ov->opacity);
 
 		time_t t = time(NULL);
 		struct tm tm;
 		localtime_r(&t, &tm);
-		glUniform4f(glGetUniformLocation(p, "iDate"), tm.tm_year + 1900, tm.tm_mon,
+		glUniform4f(ov->uniforms[6], tm.tm_year + 1900, tm.tm_mon,
 		            tm.tm_mday, tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
 
 		float cres[12];
@@ -460,21 +507,71 @@ void draw_frame(struct overlay *ov, int w, int h, double dt)
 			snprintf(name, sizeof name, "iChannel%d", i);
 			glActiveTexture(GL_TEXTURE0 + i);
 			glBindTexture(GL_TEXTURE_2D, ov->channels[i]);
-			glUniform1i(glGetUniformLocation(p, name), i);
+			glUniform1i(ov->uniforms[7 + i], i);
 			cres[i * 3 + 0] = ov->channel_res[i][0];
 			cres[i * 3 + 1] = ov->channel_res[i][1];
 			cres[i * 3 + 2] = 1;
 		}
-		glUniform3fv(glGetUniformLocation(p, "iChannelResolution"), 4, cres);
+		glUniform3fv(ov->uniforms[11], 4, cres);
+        if (ov->native_texture) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, ov->native_texture); }
 
 		for (int i = 0; i < ov->n_params; i++) {
-			GLint loc = glGetUniformLocation(p, ov->params[i].name);
+			GLint loc = ov->params[i].location;
 			if (loc >= 0)
 				glUniform1f(loc, ov->params[i].value);
 		}
 
 		glBindVertexArray(ov->vao);
 		glDrawArrays(GL_TRIANGLES, 0, 3);
-		ov->frame++;
+		ov->frame++; ov->draws++;
 	}
+}
+
+void draw_frame(struct overlay *ov, int w, int h, double dt)
+{
+    glViewport(0, 0, w, h);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (!ov->visible || ov->opacity <= 0) return;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    if (!ov->base_disabled && ov->base_opacity > 0) {
+        float opacity=ov->opacity; ov->opacity*=ov->base_opacity;
+        draw_program(ov,w,h,dt); ov->opacity=opacity;
+    }
+    for (int i = 0; i < ov->n_layers; i++) {
+        struct overlay *layer = ov->layers[i];
+        if (!layer->visible || layer->opacity <= 0) continue;
+        if (layer->output_filter[0] && ov->render_output && strcmp(layer->output_filter, ov->render_output)) continue;
+        layer->time = ov->time;
+        layer->quality = ov->quality;
+        layer->vao = ov->vao;
+        memcpy(layer->channels, ov->channels, sizeof ov->channels);
+        memcpy(layer->channel_res, ov->channel_res, sizeof ov->channel_res);
+        float opacity = layer->opacity;
+        layer->opacity *= ov->opacity;
+        draw_program(layer, w, h, dt);
+        layer->opacity = opacity;
+    }
+    glDisable(GL_BLEND);
+}
+
+/* Native-screen-shader validator / test renderer. The live overlay never binds
+ * a desktop texture; this entry point is only used by gl-overlay-still. */
+bool native_shader_load(struct overlay *ov, const char *path) {
+    char *src = read_file(path);
+    if (!src) return false;
+    const char *vertex = "#version 300 es\nout vec2 v_texcoord;\nvoid main(){ vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2)); v_texcoord=p; gl_Position=vec4(p*2.0-1.0,0,1); }\n";
+    const char *fragment = src;
+    GLuint vs = compile(GL_VERTEX_SHADER, &vertex, 1), fs = compile(GL_FRAGMENT_SHADER, &fragment, 1);
+    free(src);
+    if (!vs || !fs) { if (vs) glDeleteShader(vs); if (fs) glDeleteShader(fs); return false; }
+    GLuint p = glCreateProgram(); glAttachShader(p, vs); glAttachShader(p, fs); glLinkProgram(p);
+    glDeleteShader(vs); glDeleteShader(fs);
+    GLint ok; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { glDeleteProgram(p); return false; }
+    if (ov->program) shader_release(ov->program);
+    ov->program = p; ov->locations_cached = false;
+    glUseProgram(p); glUniform1i(glGetUniformLocation(p, "tex"), 0);
+    return true;
 }

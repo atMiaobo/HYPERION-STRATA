@@ -1,5 +1,5 @@
 {
-  description = "Hyperion-RAIN Wayland shader overlay and GTK4 control panel";
+  description = "HYPERION-CADERE composable Wayland effects and weather engine";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -16,6 +16,7 @@
         in
         {
           inherit hyperion-rain;
+          hyperion-cadere = hyperion-rain;
           default = hyperion-rain;
         });
 
@@ -24,7 +25,11 @@
         hyperion-rain = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/hyperion-rain";
-          meta.description = "Open the Hyperion-RAIN control panel";
+          meta.description = "Open the HYPERION-CADERE control panel";
+        };
+        hyperion-cadere = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/hyperion-cadere";
         };
         gl-overlay = {
           type = "app";
@@ -40,6 +45,7 @@
         {
           default = pkgs.mkShell {
             inputsFrom = [ self.packages.${system}.default ];
+            shellHook = ''export PYTHONTZPATH="${pkgs.tzdata}/share/zoneinfo"'';
           };
         });
 

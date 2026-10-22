@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -24,13 +25,13 @@ static void on_signal(int sig) { got_signal = sig; }
 static void usage(FILE *f)
 {
 	fprintf(f,
-		"Hyperion-RAIN %s · Hyprland effects overlay · a NyaBi project · nyabi.org\n"
+		"HYPERION-CADERE %s · Wayland effects engine · a NyaBi project · nyabi.org\n"
 		"\n"
 		"usage: gl-overlay [options]            run the daemon\n"
 		"       gl-overlay ctl <command> [args]  control a running daemon\n"
 		"\n"
 		"options:\n"
-		"  -s, --shader EFFECT   rain, snow, anime, sakura, anime-sakura or a .frag path\n"
+		"  -s, --shader EFFECT   effect name or .frag path (default rain; ctl effects lists names)\n"
 		"  -o, --output NAME     only cover this output (e.g. DP-1)\n"
 		"  -a, --opacity F       global opacity 0..1 (default 1)\n"
 		"  -f, --fps N           frame rate cap, e.g. 1..60 (default: monitor refresh)\n"
@@ -43,6 +44,16 @@ static void usage(FILE *f)
 		"  -v, --version\n"
 		"\n"
 		"run `gl-overlay ctl help` for control commands.\n", GL_OVERLAY_VERSION);
+}
+
+static bool number_arg(const char *arg, float lo, float hi, float *value) {
+    char *end; errno=0;
+    float v=strtof(arg,&end);
+    if(errno || end==arg || *end || !isfinite(v) || v<lo || v>hi) {
+        fprintf(stderr,"gl-overlay: invalid numeric argument '%s' (expected %g..%g)\n",arg,lo,hi);
+        return false;
+    }
+    *value=v; return true;
 }
 
 int main(int argc, char **argv)
@@ -65,6 +76,7 @@ int main(int argc, char **argv)
 		.inotify_fd = -1,
 		.timer_fd = -1,
 		.volume = 0.6f,
+        .quality = 1.0f,
 	};
 	const char *shader = NULL;
 
@@ -87,9 +99,9 @@ int main(int argc, char **argv)
 		switch (c) {
 		case 's': shader = optarg; break;
 		case 'o': ov.only_output = optarg; break;
-		case 'a': ov.opacity = strtof(optarg, NULL); break;
+		case 'a': if(!number_arg(optarg,0,1,&ov.opacity)) return 1; break;
 		case 'f': {
-			float fps = strtof(optarg, NULL);
+			float fps; if(!number_arg(optarg,0,240,&fps)) return 1;
 			ov.min_frame_interval = fps > 0 ? 1.0 / fps : 0;
 			break;
 		}
@@ -97,14 +109,15 @@ int main(int argc, char **argv)
 			char *eq = strchr(optarg, '=');
 			if (!eq) { usage(stderr); return 1; }
 			*eq = '\0';
-			param_set(&ov, optarg, strtof(eq + 1, NULL));
+			float value; if(!number_arg(eq+1,-1000000,1000000,&value)) return 1;
+            param_set(&ov,optarg,value);
 			break;
 		}
 		case 'S': socket_path = optarg; break;
 		case 'm': sound = optarg; break;
-		case 'V': ov.volume = strtof(optarg, NULL); break;
+		case 'V': if(!number_arg(optarg,0,1,&ov.volume)) return 1; break;
 		case 'h': usage(stdout); return 0;
-		case 'v': printf("Hyperion-RAIN (gl-overlay) %s · a NyaBi project\n", GL_OVERLAY_VERSION); return 0;
+		case 'v': printf("HYPERION-CADERE (gl-overlay) %s · a NyaBi project\n", GL_OVERLAY_VERSION); return 0;
 		default:  usage(stderr); return 1;
 		}
 	}
@@ -151,7 +164,7 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 
 	enum { FD_WL, FD_IPC, FD_INOTIFY, FD_TIMER, FD_COUNT };
-	struct pollfd fds[FD_COUNT] = {
+	struct pollfd fds[FD_COUNT + IPC_CLIENT_LIMIT] = {
 		[FD_WL]      = { .fd = wl_display_get_fd(ov.display), .events = POLLIN },
 		[FD_IPC]     = { .fd = ov.ipc_fd,     .events = POLLIN },
 		[FD_INOTIFY] = { .fd = ov.inotify_fd, .events = POLLIN },
@@ -166,7 +179,9 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		if (poll(fds, FD_COUNT, -1) < 0) {
+		fds[FD_INOTIFY].fd = ov.inotify_fd;
+		ipc_poll_prepare(&ov, fds+FD_COUNT);
+        if (poll(fds, FD_COUNT + IPC_CLIENT_LIMIT, ipc_has_peers(&ov) ? 100 : -1) < 0) {
 			wl_display_cancel_read(ov.display);
 			if (errno == EINTR)
 				continue;
@@ -188,6 +203,7 @@ int main(int argc, char **argv)
 			ipc_accept(&ov);
 		if (fds[FD_INOTIFY].revents & POLLIN)
 			watch_handle(&ov);
+		ipc_poll_dispatch(&ov, fds+FD_COUNT);
 		if (fds[FD_TIMER].revents & POLLIN)
 			timer_handle(&ov);
 	}

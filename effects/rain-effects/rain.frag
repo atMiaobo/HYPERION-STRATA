@@ -325,7 +325,7 @@ void shadeWater(inout vec4 acc, Water w, vec2 uv, vec3 amb, float flash) {
     vec3 n = normalize(vec3(-w.g, 1.0));
     float m = w.m, sharp = 1.0 - min(w.blur * 1.5, 1.0);
 
-    // refraction: the steeper, the further it looks; the image is inverted.
+    // Illustrative lens lighting from world(), not refraction of desktop pixels.
     // Painting light over the desktop washes its colours out, so the bright
     // parts of that image are laid on thinner than the dark ones.
     float bend = smoothstep(0.0, 1.0, s);

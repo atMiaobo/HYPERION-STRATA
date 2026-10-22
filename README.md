@@ -1,7 +1,7 @@
-# Hyperion-RAIN
+# HYPERION-CADERE
 
-**Hyperion-RAIN**, a NyaBi project ([nyabi.org](https://nyabi.org)), is a
-Hyprland effects overlay programme. The program itself is called `gl-overlay`.
+**HYPERION-CADERE** (formerly Hyperion-RAIN), a NyaBi project ([nyabi.org](https://nyabi.org)), is a
+composable Wayland effects and desktop post-processing engine. The renderer remains `gl-overlay`; existing commands, effects and settings continue to work.
 It runs full-screen GLSL shader effects on top of your whole desktop, and every
 click and keypress passes straight through to the windows underneath. Effects:
 
@@ -22,11 +22,147 @@ click and keypress passes straight through to the windows underneath. Effects:
   plum outlines, cel shadows, paper pigment and animation held on twos, inspired
   by traditional anime blossom scenes. Includes the same wind, pile and lighting controls.
 
-More are planned (fireflies, aurora, film grain, CRT). Each effect can come
+Additional stackable effects include **sunbeams**, **lens-flare**, **film-grain** and **grade**. Fireflies, aurora and CRT remain planned. Each effect can come
 with a soundtrack (rain and anime → a rain loop, snow and both sakura effects → wind), off by default.
 
 It works on any Wayland compositor with layer-shell support (Hyprland, Sway,
 KDE, niri, river, …), but it is developed on Hyprland.
+
+## Composable engine
+
+The engine has three separate capabilities:
+
+- **Portable layer-shell overlay:** particles, virtual lighting, translucent film
+  grain and approximate colour washes. Several effects can run together in one
+  shared GLES context. It cannot sample desktop pixels.
+- **Hyprland native screen shader:** one combined pass for true sampled grading,
+  static grain, static droplet distortion, frosted edges/blur and static haze.
+  The audited runtime contract is Hyprland **0.55.4**. Unknown versions retain
+  the portable backend. No time uniform or damage-tracking changes are used.
+- **Moving refraction plugin:** disabled and unimplemented. The required render
+  stages and snapshots have not been verified against version-matched headers.
+  Existing animated rain remains a translucent illustration, not desktop refraction.
+
+See [backend contracts and blockers](docs/BACKENDS.md), the
+[implementation audit](docs/IMPLEMENTATION.md) and
+[validation checklist](docs/VALIDATION.md).
+
+Start a renderer, then compose layers from another terminal:
+
+```sh
+gl-overlay -s sakura -f 30
+# Another terminal:
+gl-overlay ctl layer add rays sunbeams
+gl-overlay ctl layer add grain film-grain
+gl-overlay ctl layer add warm grade
+gl-overlay ctl layer set warm uTemperature 0.4
+gl-overlay ctl layer opacity rays 0.45
+gl-overlay ctl layer order grain 100
+gl-overlay ctl layer enable grain 0      # no draw calls; program stays cached
+gl-overlay ctl layer animate rays 0      # freeze this effect
+gl-overlay ctl layer output rays DP-1    # * returns it to every monitor
+gl-overlay ctl layer reload rays
+gl-overlay ctl engine                    # JSON: layers, parameters, draws, CPU submission time
+gl-overlay ctl outputs
+gl-overlay ctl output DP-1 fps 30
+gl-overlay ctl output DP-1 opacity 0.8
+gl-overlay ctl quality low               # reduced buffer size when viewporter is present
+```
+
+The legacy primary effect is always bottommost. Added layers sort by integer
+order, then ID. `load` changes only the primary effect; `base 0` disables it.
+Global `set opacity` still applies to the entire overlay. Layer opacity applies
+only to that layer. Up to 16 additional layers and 1024 parameters per program
+are supported, with bounded shader sources and no per-frame uniform lookups.
+Named output settings survive monitor hotplug during the renderer's lifetime.
+`output NAME enabled 0` clears that monitor and stops its frame loop.
+
+For persistence, profiles, weather and native processing, run the optional
+standard-library controller. It does not require GTK:
+
+```sh
+hyperion-cadere --start-overlay serve     # owns/stops the renderer it starts; default 30 FPS
+# Or: hyperion-cadere serve               # connect to an existing renderer
+# Another terminal:
+hyperion-cadere layer add petals sakura
+hyperion-cadere layer add rays sunbeams
+hyperion-cadere screen set temperature 0.35
+hyperion-cadere screen enable             # refuses to replace someone else's shader
+hyperion-cadere screen set saturation 1.1
+hyperion-cadere screen set grain 0.025
+hyperion-cadere profile save desktop manual
+hyperion-cadere profile load desktop
+hyperion-cadere status
+```
+
+Use controller layer commands for persistent scenes. Direct `gl-overlay ctl`
+layer changes remain temporary, as legacy renderer commands were. GUI layer
+changes use the controller when it is connected; otherwise the GUI retains its
+own settings. Do not use the same layer ID from multiple controllers.
+
+`screen disable` restores the previous shader and disables screen processing
+without discarding its settings. `screen portable` restores it while keeping the
+approximate portable wash/grain. Portable saturation, contrast, exposure, gamma,
+refraction and blur are explicitly unsupported. `screen claim replace` is an
+explicit opt-in to take over an existing shader; the previous path is remembered.
+`screen recover` restores a recovery journal after an unclean exit, only if the
+active shader is still the journal's owned path. If another application changes
+the setting, ownership is relinquished without overwriting that application.
+Native generation is debounced and rate-limited to once per two seconds, even
+while automation interpolates. Static displacement is opt-in and experimental: native damage expansion is
+not verified and partial redraw artifacts remain a manual validation item.
+Native grain is static; portable grain can vary
+at 12/24 FPS. The engine never disables damage tracking or captures the desktop.
+If hyprsunset is detected running, temperature/gamma ownership requires explicit
+`screen colour-manager-opt-in 1`.
+
+## Weather and time
+
+Automatic mode uses Open-Meteo's forecast API with explicitly configured
+coordinates. It never performs IP or background geolocation. An optional third
+argument selects an IANA timezone; the default is Open-Meteo's `auto` timezone.
+
+```sh
+hyperion-cadere location 35.68 139.69 Asia/Tokyo   # example coordinates
+hyperion-cadere weather interval 1200            # 900–1800 seconds
+hyperion-cadere transition 30
+hyperion-cadere mode automatic
+hyperion-cadere mode hybrid
+hyperion-cadere override screen.temperature 0.2
+hyperion-cadere override auto-rain.opacity 0     # keep rain off in hybrid mode
+hyperion-cadere override auto-rain.opacity clear
+hyperion-cadere profile save weather environment
+hyperion-cadere profile merge desktop
+hyperion-cadere mode manual                     # fade automatic layers away
+```
+
+Scenes cover clear morning, sunny daytime, overcast, golden hour, rainy,
+stormy, snowy and nighttime. Meteorological wind direction and speed drive drift;
+cloud cover attenuates virtual sunbeams/flares. Rain and snow intensities follow
+precipitation. Sunrise/sunset and a wall clock infer a virtual light source;
+there is no desktop luminance detection or astronomical sun-position claim.
+Automatic layers use reserved IDs and leave manual layers alone. Hybrid overrides
+win over automated values and are saved until cleared. Applying an original
+per-effect preset retains its original reset semantics.
+
+Fetching uses one sleeping worker with an eight-second timeout, bounded responses,
+validated units, a private offline cache and exponential backoff. Status includes
+provider, location, condition, scene, update time, stale state and errors. With no
+location or usable data, automation starts safely without a weather effect.
+A stale cache is indicated and retained when refreshing fails. Native screen
+transitions update at most every two seconds; overlay parameter transitions run
+at 10 Hz during their finite duration. Neither fetches weather per render frame.
+
+State is stored under `$XDG_CONFIG_HOME/hyperion-cadere`, generated shaders and
+socket under `$XDG_RUNTIME_DIR/hyperion-cadere`, and weather cache under
+`$XDG_CACHE_HOME/hyperion-cadere`. Directories are private (0700); files/sockets
+are 0600, and settings/shaders are written atomically. Original GUI settings stay
+in their existing `hyperion-rain/gui.json` path.
+
+For Nix, use `nix run .#gl-overlay --` or `nix run .#hyperion-cadere --` in
+place of the corresponding command above. Use `path:.` for a checkout containing
+new untracked files. To develop without installing, add `build` to `PATH` and run
+`python3 controller/hyperion-cadere.py serve` inside `nix develop`.
 
 ## Build & run
 
@@ -194,13 +330,16 @@ hyperion-rain --run "start; preset storm"
 ```
 
 The control panel is a small GTK4 window for trying the overlay out, styled like
-Hyperion-PAKT. It has four views:
+Hyperion-PAKT. It retains the GTK4/NyaBi design and now has eight views:
 
-- **effects:** pick rain, snow, anime rain, sakura or anime-sakura (the planned ones are listed, not
-  selectable yet). Each effect keeps its own settings.
+- **effects:** independent toggles for the original five effects plus sunbeams, lens flares, film grain and a portable grade; select controls to edit an effect. Each retains its settings.
 - **control:** start or stop the daemon, show/hide, pause, frame rate, and a
   stepper plus slider for every parameter. Changes go to the running overlay
   live.
+- **environment:** manual/automatic/hybrid mode, explicit location, refresh, transitions, overrides and weather status.
+- **screen:** grading, static refraction/frost, grain, ownership and restoration. Controls marked native-only require that backend.
+- **lighting:** virtual sunbeam/flare controls with source and brightness settings.
+- **advanced:** quality, output assignment/settings, saved profiles and backend diagnostics.
 - **presets:** per effect. Rain: dream, realistic, drizzle, quiet teal, storm,
   neon night. Snow: steady, flurries, still night, blizzard. Both sakura modes:
   golden hour, noon, night, sunset wash, orchard breeze, blossom storm and settling.
@@ -261,9 +400,7 @@ The overlay rules:
 - **Tunable params:** declare `uniform float uFoo;` plus
   `#pragma param uFoo 0.5` to set its default. GLSL ignores the pragma; the
   daemon reads it. Values set over IPC survive reloads.
-- **No backdrop sampling.** A layer-shell client can't read the pixels
-  beneath it, so "refraction" is faked with highlights and shadows. See
-  roadmap.
+- **No backdrop sampling in overlay shaders.** A layer-shell client cannot read desktop pixels. Rain highlights are illustrative; actual static texture displacement is implemented separately by the native screen backend.
 - **No pointer.** The surface has an empty input region, so it never receives
   pointer events. `iMouse` is zero unless you push it:
   `ctl set iMouse.x 100`.
@@ -453,7 +590,7 @@ to use Mesa software rendering when a compatible Mesa driver is available.
 
 | piece | choice |
 |---|---|
-| language | C11, ~1.2k lines, no toolkit |
+| language | C11 renderer; optional standard-library Python controller |
 | surface | `zwlr_layer_shell_v1`, layer `OVERLAY`, anchored to all edges, `exclusive_zone = -1` (covers bars), keyboard interactivity `NONE`, one surface per `wl_output` (hotplug handled) |
 | passthrough | `wl_surface.set_input_region(<empty region>)`. **Not `NULL`:** `NULL` means *infinite* and would swallow every click |
 | GPU | EGL 1.5 (`EGL_PLATFORM_WAYLAND_KHR`) + GLES 3.0, RGBA8 config, one shared context, fullscreen triangle |
@@ -466,9 +603,7 @@ Source: `src/wayland.c` (surfaces), `src/render.c` (EGL, shader wrapping),
 
 ## Roadmap
 
-- **Real refraction.** Capture the output via `ext-image-copy-capture-v1`
-  (or `wlr-screencopy`), bind it as `iChannel0`, and sample through each drop's
-  normal. The overlay itself has to be excluded from the capture.
+- **Moving desktop refraction:** a version-matched compositor-stage backend with verified snapshots, ordering, damage expansion and a shared mask clock. It remains disabled; capture loops are not used.
 - `ctl channel N image.png` to load textures.
 - An X11 backend (ARGB override-redirect window, XShape empty input) for
   non-Wayland sessions.

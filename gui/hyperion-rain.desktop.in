@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Hyperion-RAIN
+Name=HYPERION-CADERE
 GenericName=Screen effects overlay
-Comment=Rain, snow and sakura petals over your Hyprland desktop · a NyaBi project
+Comment=Composable desktop effects, virtual lighting and weather · a NyaBi project
 Exec=@BINDIR@/hyperion-rain
 Icon=org.nyabi.hyperion_rain
 StartupWMClass=org.nyabi.hyperion_rain
 Terminal=false
 Categories=Settings;DesktopSettings;
-Keywords=rain;snow;sakura;petals;anime;overlay;shader;effects;hyprland;rice;
+Keywords=weather;sunbeams;grain;rain;snow;sakura;petals;anime;overlay;shader;effects;hyprland;rice;

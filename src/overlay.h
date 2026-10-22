@@ -2,12 +2,15 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <poll.h>
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 
-#define MAX_PARAMS 32
+#define PARAM_LIMIT 1024
+#define LAYER_LIMIT 16
+#define BUILTIN_UNIFORMS 16
 
 struct output {
 	struct wl_list link;
@@ -16,6 +19,12 @@ struct output {
 	struct wl_output *wl_output;
 	char name[64];
 	int32_t scale;
+    uint32_t fractional_scale;
+    struct wp_viewport *viewport;
+    struct wp_fractional_scale_v1 *fractional;
+    int buffer_width, buffer_height;
+    bool disabled;
+    float output_opacity, fps_override;
 
 	struct wl_surface *surface;
 	struct zwlr_layer_surface_v1 *layer_surface;
@@ -33,9 +42,19 @@ struct output {
 struct param {
 	char name[64];
 	float value;
+	GLint location;
 	bool overridden; /* set via IPC: survives shader reloads */
 };
 
+#define IPC_CLIENT_LIMIT 8
+struct ipc_peer {
+    int fd;
+    char input[8192];
+    size_t length, sent, response_length;
+    char *response;
+    double deadline;
+};
+struct output_rule { char name[64]; float opacity, fps; bool disabled; };
 struct overlay {
 	/* wayland */
 	struct wl_display *display;
@@ -49,15 +68,31 @@ struct overlay {
 	EGLDisplay egl_display;
 	EGLConfig egl_config;
 	EGLContext egl_context;
-	GLuint program, vao;
+	GLuint program, vao, native_texture;
 	GLuint channels[4];
 	int channel_res[4][2];
 
 	/* shader state */
 	char shader_path[4096];
-	struct param params[MAX_PARAMS];
+	struct param *params;
+    int params_capacity;
+    GLint uniforms[BUILTIN_UNIFORMS];
+    bool locations_cached, static_shader;
+    struct overlay **layers;
+    int n_layers, order;
+    char layer_id[64], output_filter[64];
+    bool base_disabled, frozen;
+    double frozen_time;
+    float quality;
+    const char *render_output;
+    double cpu_frame_ms;
+    unsigned long draws;
+    struct output_rule output_rules[32];
+    int n_output_rules;
+    struct wp_viewporter *viewporter;
+    struct wp_fractional_scale_manager_v1 *fractional_manager;
 	int n_params;
-	float opacity;
+	float opacity, base_opacity;
 	bool visible;
 	bool paused;
 	double time, time_offset, last_frame;
@@ -76,7 +111,8 @@ struct overlay {
 	void *mpv;
 
 	/* ipc / file watching */
-	int ipc_fd;
+	struct ipc_peer peers[IPC_CLIENT_LIMIT];
+    int ipc_fd;
 	char ipc_path[108]; /* sizeof sockaddr_un.sun_path */
 	int inotify_fd, inotify_wd;
 	int timer_fd;
@@ -125,3 +161,20 @@ void ipc_accept(struct overlay *ov);
 int ipc_client(const char *socket_path, int argc, char **argv);
 void watch_shader(struct overlay *ov);
 void watch_handle(struct overlay *ov);
+
+/* engine.c: shared-context composition; no background capture. */
+struct overlay *layer_find(struct overlay *ov, const char *id);
+bool layer_add(struct overlay *ov, const char *id, const char *effect);
+void layer_free(struct overlay *layer);
+bool engine_command(struct overlay *ov, int fd, const char *line);
+bool engine_animated(struct overlay *ov, const char *output);
+double engine_step(struct overlay *ov, const char *output);
+void output_resize_buffer(struct output *out);
+
+bool native_shader_load(struct overlay *ov, const char *path);
+
+void shader_release(GLuint program);
+
+void ipc_poll_prepare(struct overlay *ov, struct pollfd *fds);
+void ipc_poll_dispatch(struct overlay *ov, struct pollfd *fds);
+bool ipc_has_peers(struct overlay *ov);

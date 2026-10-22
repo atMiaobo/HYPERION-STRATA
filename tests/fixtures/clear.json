@@ -1,0 +1,1 @@
+{"timezone":"Asia/Taipei","current_units":{"time":"unixtime","rain":"mm","snowfall":"cm","wind_speed_10m":"m/s"},"current":{"time":1792728000,"weather_code":0,"precipitation":0,"rain":0,"snowfall":0,"cloud_cover":5,"wind_speed_10m":4,"wind_direction_10m":90,"is_day":1},"daily":{"sunrise":[1792706400],"sunset":[1792749600]}}

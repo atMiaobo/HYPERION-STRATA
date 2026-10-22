@@ -16,6 +16,8 @@
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -24,7 +26,12 @@
 
 static const char *help_text =
 	"commands:\n"
-	"  load <effect|path>    rain, snow, anime, sakura, anime-sakura or a .frag file\n"
+    "  engine | outputs      structured renderer status / monitor diagnostics\n"
+    "  base 0|1; quality low|balanced|high\n"
+    "  layer list|add ID EFFECT|remove ID|reload ID\n"
+    "  layer enable|animate|opacity|order|output ID VALUE\n"
+    "  layer set ID PARAM VALUE; output NAME enabled|opacity|fps VALUE\n"
+	"  load <effect|path>    replace primary effect (ctl effects lists names)\n"
 	"  effects               list the effects that load can find\n"
 	"  reload                recompile the current shader\n"
 	"  set <name> <float>    set a shader uniform (or 'opacity')\n"
@@ -49,6 +56,7 @@ static void default_socket_path(char *buf, size_t len)
 
 bool ipc_init(struct overlay *ov)
 {
+    for (int i=0;i<IPC_CLIENT_LIMIT;i++) ov->peers[i].fd=-1;
 	if (!ov->ipc_path[0])
 		default_socket_path(ov->ipc_path, sizeof ov->ipc_path);
 
@@ -64,6 +72,7 @@ bool ipc_init(struct overlay *ov)
 	}
 	close(probe);
 	unlink(ov->ipc_path);
+    mode_t old_umask = umask(0077);
 
 	ov->ipc_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (bind(ov->ipc_fd, (struct sockaddr *)&addr, sizeof addr) < 0 ||
@@ -71,11 +80,13 @@ bool ipc_init(struct overlay *ov)
 		fprintf(stderr, "gl-overlay: cannot bind %s: %s\n", ov->ipc_path, strerror(errno));
 		return false;
 	}
+	umask(old_umask);
 	return true;
 }
 
 void ipc_finish(struct overlay *ov)
 {
+    for (int i=0;i<IPC_CLIENT_LIMIT;i++) { if(ov->peers[i].fd>=0) close(ov->peers[i].fd); free(ov->peers[i].response); }
 	if (ov->ipc_fd > 0) {
 		close(ov->ipc_fd);
 		unlink(ov->ipc_path);
@@ -103,6 +114,10 @@ static void reply_effect(const char *name, const char *path, void *data)
 
 static void handle_command(struct overlay *ov, int fd, char *line)
 {
+	if (engine_command(ov, fd, line)) {
+        if (!strncmp(line,"layer add ",10) || !strncmp(line,"layer remove ",13)) watch_shader(ov);
+        return;
+    }
 	char *save = NULL;
 	char *cmd = strtok_r(line, " \t\r\n", &save);
 	char *a1, *a2 = NULL;
@@ -165,9 +180,12 @@ static void handle_command(struct overlay *ov, int fd, char *line)
 		sound_update(ov, true);
 		reply(fd, "volume %g\n", ov->volume);
 	} else if (!strcmp(cmd, "set") && a1 && a2) {
-		float v = strtof(a2, NULL);
-		if (!strcmp(a1, "opacity"))
+		char *end; float v = strtof(a2, &end);
+        if (*end || !isfinite(v) || fabsf(v) > 1000000) { reply(fd, "error: invalid number\n"); return; }
+		if (!strcmp(a1, "opacity")) {
+            if(v < 0 || v > 1) { reply(fd,"error: opacity must be 0..1\n"); return; }
 			ov->opacity = v;
+        }
 		else if (!strcmp(a1, "volume"))
 			ov->volume = fminf(fmaxf(v, 0.0f), 1.0f);
 		else
@@ -175,6 +193,8 @@ static void handle_command(struct overlay *ov, int fd, char *line)
 		outputs_schedule_all(ov);
 		reply(fd, "ok\n");
 	} else if (!strcmp(cmd, "add") && a1 && a2) {
+        char *end; float delta=strtof(a2,&end);
+        if(end==a2 || *end || !isfinite(delta) || fabsf(delta)>1000000) { reply(fd,"error: invalid delta\n"); return; }
 		float v;
 		if (!strcmp(a1, "opacity")) {
 			ov->opacity = v = fminf(fmaxf(ov->opacity + strtof(a2, NULL), 0.0f), 1.0f);
@@ -206,7 +226,8 @@ static void handle_command(struct overlay *ov, int fd, char *line)
 		outputs_schedule_all(ov);
 		reply(fd, "%s\n", ov->paused ? "paused" : "running");
 	} else if (!strcmp(cmd, "fps") && a1) {
-		float fps = strtof(a1, NULL);
+		char *end; float fps = strtof(a1, &end);
+        if(end==a1 || *end || !isfinite(fps) || fps<0 || fps>240) { reply(fd,"error: fps must be 0..240\n"); return; }
 		ov->min_frame_interval = fps > 0 ? 1.0 / fps : 0;
 		outputs_schedule_all(ov);
 		reply(fd, "ok\n");
@@ -229,22 +250,61 @@ static void handle_command(struct overlay *ov, int fd, char *line)
 	}
 }
 
-void ipc_accept(struct overlay *ov)
-{
-	int fd;
-	while ((fd = accept4(ov->ipc_fd, NULL, NULL, SOCK_CLOEXEC)) >= 0) {
-		/* Clients send one short line right away; don't let a stuck one hang us. */
-		struct timeval tv = { .tv_usec = 200000 };
-		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-		char buf[1024];
-		ssize_t n = read(fd, buf, sizeof buf - 1);
-		if (n > 0) {
-			buf[n] = '\0';
-			handle_command(ov, fd, buf);
-			sound_update(ov, true); /* follows pause/hide/load/set at once */
-		}
-		close(fd);
-	}
+static void peer_close(struct ipc_peer *peer) {
+    if (peer->fd >= 0) close(peer->fd);
+    free(peer->response); memset(peer,0,sizeof *peer); peer->fd=-1;
+}
+void ipc_accept(struct overlay *ov) {
+    int fd;
+    while ((fd=accept4(ov->ipc_fd,NULL,NULL,SOCK_CLOEXEC|SOCK_NONBLOCK))>=0) {
+        int slot=-1;
+        for(int i=0;i<IPC_CLIENT_LIMIT;i++) if(ov->peers[i].fd<0) {slot=i;break;}
+        if(slot<0) {close(fd);continue;}
+        ov->peers[slot].fd=fd; ov->peers[slot].deadline=now_seconds()+.5;
+    }
+}
+bool ipc_has_peers(struct overlay *ov) {
+    for(int i=0;i<IPC_CLIENT_LIMIT;i++) if(ov->peers[i].fd>=0) return true;
+    return false;
+}
+void ipc_poll_prepare(struct overlay *ov, struct pollfd *fds) {
+    for(int i=0;i<IPC_CLIENT_LIMIT;i++) fds[i]=(struct pollfd){.fd=ov->peers[i].fd,
+        .events=ov->peers[i].response ? POLLOUT : POLLIN};
+}
+void ipc_poll_dispatch(struct overlay *ov, struct pollfd *fds) {
+    for(int i=0;i<IPC_CLIENT_LIMIT;i++) {
+        struct ipc_peer *p=&ov->peers[i];
+        if(p->fd<0) continue;
+        if(now_seconds()>p->deadline || (fds[i].revents & (POLLERR|POLLNVAL))) {peer_close(p);continue;}
+        if(!p->response && (fds[i].revents & (POLLIN|POLLHUP))) {
+            ssize_t n=read(p->fd,p->input+p->length,sizeof p->input-p->length-1);
+            if(n<0 && (errno==EAGAIN || errno==EINTR)) continue;
+            if(n<0) {peer_close(p);continue;}
+            p->length+=n; p->input[p->length]=0;
+            char *newline=strchr(p->input,'\n');
+            if(!newline && n>0 && p->length<sizeof p->input-1) continue;
+            if(newline) *newline=0;
+            int response=memfd_create("cadere-ipc",MFD_CLOEXEC);
+            if(response<0) {peer_close(p);continue;}
+            if (ov->egl_context) eglMakeCurrent(ov->egl_display,EGL_NO_SURFACE,EGL_NO_SURFACE,ov->egl_context);
+            handle_command(ov,response,p->input);
+            sound_update(ov,true);
+            off_t size=lseek(response,0,SEEK_END);
+            if(size<0 || size>1000000) {close(response);peer_close(p);continue;}
+            p->response=malloc(size+1);
+            if(!p->response) {close(response);peer_close(p);continue;}
+            lseek(response,0,SEEK_SET);
+            ssize_t got=read(response,p->response,size); close(response);
+            if(got!=size) {peer_close(p);continue;}
+            p->response_length=size; p->deadline=now_seconds()+1;
+        }
+        if(p->response) {
+            ssize_t n=write(p->fd,p->response+p->sent,p->response_length-p->sent);
+            if(n>0) p->sent+=n;
+            else if(n<0 && errno!=EAGAIN && errno!=EINTR) {peer_close(p);continue;}
+            if(p->sent==p->response_length) peer_close(p);
+        }
+    }
 }
 
 int ipc_client(const char *socket_path, int argc, char **argv)
@@ -255,6 +315,13 @@ int ipc_client(const char *socket_path, int argc, char **argv)
 	else
 		default_socket_path(path, sizeof path);
 
+    if (argc > 0 && (!strcmp(argv[0], "screen") || !strcmp(argv[0], "weather") ||
+        !strcmp(argv[0], "mode") || !strcmp(argv[0], "location") || !strcmp(argv[0], "transition") ||
+        !strcmp(argv[0], "profile") || !strcmp(argv[0], "override") || !strcmp(argv[0], "capabilities") || !strcmp(argv[0], "diagnostics"))) {
+        const char *runtime = getenv("XDG_RUNTIME_DIR");
+        if (!runtime) { fprintf(stderr, "controller CLI requires XDG_RUNTIME_DIR\n"); return 1; }
+        snprintf(path, sizeof path, "%s/hyperion-cadere/controller.sock", runtime);
+    }
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
 	snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -294,36 +361,35 @@ int ipc_client(const char *socket_path, int argc, char **argv)
  */
 void watch_shader(struct overlay *ov)
 {
-	if (ov->inotify_fd <= 0)
-		ov->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-	if (ov->inotify_wd > 0)
-		inotify_rm_watch(ov->inotify_fd, ov->inotify_wd);
-
-	char dir[4096];
-	snprintf(dir, sizeof dir, "%s", ov->shader_path);
-	ov->inotify_wd = inotify_add_watch(ov->inotify_fd, dirname(dir),
-	                                   IN_CLOSE_WRITE | IN_MOVED_TO);
+	if (ov->inotify_fd >= 0) close(ov->inotify_fd);
+    ov->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    for (int i = -1; i < ov->n_layers; i++) {
+        struct overlay *layer = i < 0 ? ov : ov->layers[i];
+        char dir[4096]; snprintf(dir, sizeof dir, "%s", layer->shader_path);
+        layer->inotify_wd = inotify_add_watch(ov->inotify_fd, dirname(dir), IN_CLOSE_WRITE | IN_MOVED_TO);
+    }
 }
 
 void watch_handle(struct overlay *ov)
 {
+    if (ov->egl_context) eglMakeCurrent(ov->egl_display,EGL_NO_SURFACE,EGL_NO_SURFACE,ov->egl_context);
 	char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-	char base_buf[4096];
-	snprintf(base_buf, sizeof base_buf, "%s", ov->shader_path);
-	const char *base = basename(base_buf);
-	bool hit = false;
-
-	ssize_t n;
-	while ((n = read(ov->inotify_fd, buf, sizeof buf)) > 0) {
-		for (char *p = buf; p < buf + n;) {
-			struct inotify_event *ev = (struct inotify_event *)p;
-			if (ev->len && !strcmp(ev->name, base))
-				hit = true;
-			p += sizeof *ev + ev->len;
-		}
-	}
-	if (hit) {
-		shader_load(ov, ov->shader_path); /* on error the old shader keeps running */
-		outputs_schedule_all(ov);
-	}
+    bool hit = false;
+    ssize_t n;
+    while ((n = read(ov->inotify_fd, buf, sizeof buf)) > 0) {
+        for (char *p = buf; p < buf + n;) {
+            struct inotify_event *ev = (struct inotify_event *)p;
+            for (int i = -1; i < ov->n_layers; i++) {
+                struct overlay *layer = i < 0 ? ov : ov->layers[i];
+                const char *base = strrchr(layer->shader_path, '/');
+                base = base ? base + 1 : layer->shader_path;
+                if (ev->len && ev->wd == layer->inotify_wd && !strcmp(ev->name, base)) {
+                    shader_load(layer, layer->shader_path);
+                    hit = true;
+                }
+            }
+            p += sizeof *ev + ev->len;
+        }
+    }
+    if (hit) outputs_schedule_all(ov);
 }

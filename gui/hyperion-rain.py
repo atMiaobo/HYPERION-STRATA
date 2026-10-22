@@ -9,6 +9,8 @@ Style = Hyperion-PAKT's terminal / system-log look: NyaBi TTY palette, JetBrains
 the one outlined primary button per place, other keys as "[ text ]", options as "› chosen  other", colour only for
 meaning, a log column with a prompt on the right.
 """
+import concurrent.futures
+import sys
 import datetime
 import getpass
 import json
@@ -27,7 +29,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 APP_ID = "org.nyabi.hyperion_rain"                  # = the .desktop file and icon name
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent                                   # when run from the source tree
@@ -35,6 +37,12 @@ SOCKET = Path(os.environ.get("GL_OVERLAY_SOCKET")
               or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "gl-overlay.sock")
 PREFS = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "hyperion-rain" / "gui.json"
 USER = getpass.getuser()
+for module_root in (REPO / "controller", REPO / "share/gl-overlay/controller"):
+    if module_root.exists(): sys.path.insert(0, str(module_root))
+from cadere.screen import SPECS as SCREEN_SPECS
+from cadere.service import request as controller_request
+from cadere.storage import atomic as atomic_write, directory as state_directory
+
 
 # --------------------------------------------------------------------------------------------- palette (= PAKT)
 DARK = dict(name="dark", bg="#000000", fg="#d4d4d4", dim="#6a6a6a", mid="#a0a0a0", hi="#ffffff",
@@ -185,6 +193,11 @@ PETAL_PRESETS = [
      {"uPetals": 2, "uWind": .6, "uGusts": 1.5, "uFlutter": 1.4, "uPile": 1.3}),
     ("settling", "a petal bed builds up over two minutes", {"uPile": 1, "uPileTime": 120, "uFall": .8}),
 ]
+SUNBEAMS = [('uOriginX', 'OriginX', -0.5, 1.5, 0.01, 0.15, 'virtual source'), ('uOriginY', 'OriginY', -0.5, 1.5, 0.01, 1.1, 'virtual source'), ('uAngle', 'Angle', -180, 180, 1, 25.0, ''), ('uSpread', 'Spread', 0.05, 2, 0.05, 0.8, ''), ('uSoftness', 'Softness', 0, 1, 0.05, 0.5, ''), ('uLength', 'Length', 0.1, 4, 0.1, 1.5, ''), ('uIntensity', 'Intensity', 0, 0.4, 0.005, 0.12, ''), ('uHaze', 'Haze', 0, 1, 0.05, 0.25, ''), ('uMotion', 'Motion', 0, 2, 0.05, 0.4, ''), ('uSpeed', 'Speed', 0, 3, 0.05, 1.0, ''), ('uHue', 'Hue', 0, 1, 0.01, 0.1, '')]
+LENS_FLARE = [('uOriginX', 'OriginX', -0.5, 1.5, 0.01, 0.2, 'virtual source'), ('uOriginY', 'OriginY', -0.5, 1.5, 0.01, 0.85, 'virtual source'), ('uIntensity', 'Intensity', 0, 0.4, 0.005, 0.08, ''), ('uRadius', 'Radius', 0.015, 0.5, 0.005, 0.14, ''), ('uSpread', 'Spread', 0.05, 2, 0.05, 0.65, ''), ('uStreaks', 'Streaks', 0, 2, 0.05, 0.6, ''), ('uHalos', 'Halos', 0, 2, 0.05, 0.4, ''), ('uGhosts', 'Ghosts', 0, 2, 0.05, 0.5, ''), ('uGlints', 'Glints', 0, 2, 0.05, 0.3, ''), ('uDispersion', 'Dispersion', 0, 1, 0.05, 0.35, ''), ('uHue', 'Hue', 0, 1, 0.01, 0.08, '')]
+FILM_GRAIN = [('uIntensity', 'Intensity', 0, 0.15, 0.005, 0.035, ''), ('uSize', 'Size', 1, 8, 1, 1.0, ''), ('uMono', 'Mono', 0, 1, 1, 1.0, ''), ('uHue', 'Hue', 0, 1, 0.01, 0.08, ''), ('uColour', 'Colour', 0, 1, 0.05, 0.0, ''), ('uTemporal', 'Temporal', 0, 1, 1, 1.0, ''), ('uSpeed', 'Speed', 0, 3, 0.05, 1.0, ''), ('uStep', 'Step', 1, 60, 1, 12.0, '')]
+GRADE = [('uTemperature', 'Temperature', -1, 1, 0.05, 0.0, ''), ('uTintHue', 'TintHue', 0, 1, 0.01, 0.08, ''), ('uTintOpacity', 'TintOpacity', 0, 0.3, 0.005, 0.0, ''), ('uVignette', 'Vignette', 0, 0.8, 0.05, 0.0, '')]
+
 OPACITY = ("opacity", "opacity", 0, 1, .05, 1.0, "the whole overlay, any effect")
 VOLUME = ("volume", "volume", 0, 1, .05, 0.6, "follows the weather's strength")
 
@@ -243,12 +256,15 @@ EFFECTS = [
              ("spring film", "pale midday cels, soft outlines and a gentle wash",
               {"uLight": 0, "uInk": .4, "uScreenTint": 1, "uTint": .035, "uFall": .75}),
          ]),
+    dict(id='sunbeams', kanji='光', strength='uIntensity', sound="", desc='virtual sunbeams', groups=[("controls", "", SUNBEAMS)], presets=[("subtle", "the default", {})]),
+    dict(id='lens-flare', kanji='陽', strength='uIntensity', sound="", desc='virtual lens flare', groups=[("controls", "", LENS_FLARE)], presets=[("subtle", "the default", {})]),
+    dict(id='film-grain', kanji='粒', strength='uIntensity', sound="", desc='portable film grain', groups=[("controls", "", FILM_GRAIN)], presets=[("subtle", "the default", {})]),
+    dict(id='grade', kanji='色', strength='uTemperature', sound="", desc='approximate colour wash', groups=[("controls", "", GRADE)], presets=[("subtle", "the default", {})]),
 ]
 EFFECT = {e["id"]: e for e in EFFECTS}
 PLANNED = [  # shown in the effects list, not selectable yet
     ("fireflies", "蛍", "slow drifting lights low on the screen"),
     ("aurora", "光", "curtains of light along the top edge"),
-    ("film grain", "粒", "grain, gate weave and flicker"),
     ("crt", "線", "scanlines, shadow mask, a little bloom"),
 ]
 
@@ -261,7 +277,7 @@ def defaults_of(eid):
     return {k: p[5] for k, p in params_of(eid).items()}
 
 
-VIEWS = ["effects", "control", "presets", "hyprland"]
+VIEWS = ["effects", "control", "environment", "screen", "lighting", "advanced", "presets", "hyprland"]
 FPS = ("fps", "frames / s", 1, 60, 1, 30, "1 = a slideshow, almost free · 60 = smooth, full GPU cost")
 KEYS = [  # (id, label, default combo, ctl command, repeat); {noun} / {strength} = the current effect's
     ("toggle", "show / hide", "SUPER + ALT + R", "toggle", False),
@@ -500,6 +516,12 @@ class RainPanel(Gtk.Application):
         self.fps = min(max(int(prefs.get("fps", 30)), 1), 60) if prefs.get("fps", 30) else 60  # 0 = old "max"
         self.keys = dict({k[0]: k[2] for k in KEYS}, **prefs.get("keys", {}))
         self.view = prefs.get("view", "control")
+        self.composable = bool(prefs.get("composable", False))
+        self.enabled = prefs.get("enabled", {})
+        self.layer_values = {eid: {"layerOpacity": prefs.get("layer_opacity", {}).get(eid, 1.0)} for eid in EFFECT}
+        self.control_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="panel-control")
+        self.control_status = {}
+        self.control_pending = False
         self.quiet = 0
         self.refreshers = []
         self.steppers = {}
@@ -517,11 +539,13 @@ class RainPanel(Gtk.Application):
 
     def save_prefs(self):
         try:
-            PREFS.parent.mkdir(parents=True, exist_ok=True)
-            PREFS.write_text(json.dumps(dict(theme=self.theme, effect=self.effect,
+            PREFS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            PREFS.parent.chmod(0o700)
+            atomic_write(PREFS, json.dumps(dict(theme=self.theme, effect=self.effect,
                                              values=dict(self.values, _=self.globals), fps=self.fps,
                                              keys=self.keys, view=self.view, sound=self.sound,
-                                             track=self.track), indent=1))
+                                             track=self.track, composable=self.composable, enabled=self.enabled,
+                                             layer_opacity={eid: v["layerOpacity"] for eid,v in self.layer_values.items()}), indent=1))
         except OSError:
             pass
 
@@ -546,7 +570,7 @@ class RainPanel(Gtk.Application):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_USER)
         Gtk.Window.set_default_icon_name(APP_ID)
-        win = Gtk.ApplicationWindow(application=self, title="Hyperion-RAIN")
+        win = Gtk.ApplicationWindow(application=self, title="HYPERION-CADERE")
         win.set_default_size(1240, 780)
         win.add_css_class("bg")
         root = Gtk.Box()
@@ -559,6 +583,8 @@ class RainPanel(Gtk.Application):
         self.stack = Gtk.Stack()
         self.stack.set_vexpand(True)
         for name, build in (("effects", self.build_effects), ("control", self.build_control),
+                            ("environment", self.build_environment), ("screen", self.build_screen),
+                            ("lighting", self.build_lighting), ("advanced", self.build_advanced),
                             ("presets", self.build_presets), ("hyprland", self.build_hyprland)):
             sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
             inner = build()
@@ -615,8 +641,8 @@ class RainPanel(Gtk.Application):
         top.set_margin_end(28)
         top.set_margin_top(20)
         names = vbox(2)
-        names.append(lbl("HYPERION // RAIN", "title"))
-        names.append(lbl(f"hyprland effects overlay · v{VERSION}", "small", "dim"))
+        names.append(lbl("HYPERION // CADERE", "title"))
+        names.append(lbl(f"composable desktop effects · v{VERSION}", "small", "dim"))
         top.append(names)
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
@@ -790,6 +816,11 @@ class RainPanel(Gtk.Application):
         while child := self.param_box.get_first_child():
             self.param_box.remove(child)
         self.steppers = {}
+        if self.composable:
+            spec = ("layerOpacity", "layer opacity", 0, 1, .05, 1.0, "this effect only")
+            st = Stepper(self, spec, self.layer_values[self.effect], self.set_layer_opacity)
+            self.layer_opacity_stepper = st
+            self.param_box.append(st.widget)
         groups = EFFECT[self.effect]["groups"]
         for i, (title, hint, group) in enumerate(groups):
             s = section(f"{self.effect} · {title}" if i == 0 else title, hint)
@@ -811,12 +842,17 @@ class RainPanel(Gtk.Application):
 
     def build_effects(self):
         box = vbox(18)
-        box.append(lbl("One effect runs at a time. Switching keeps the daemon running and loads the other "
-                       "shader; each effect remembers its own settings.", "prose", wrap=True))
+        box.append(lbl("Toggle effects independently. Controls selects an effect to edit; enabled layers compose in order. The legacy primary effect remains available in control.", "prose", wrap=True))
         self.effect_rows = {}
+        self.effect_toggles = {}
         for e in EFFECTS:
             row, mark, use = self.effect_row(e["id"], e["kanji"], e["desc"], True)
             use.connect("clicked", lambda _b, eid=e["id"]: self.set_effect(eid))
+            toggle = Gtk.CheckButton(label="enabled")
+            toggle.set_active(bool(self.enabled.get(e["id"], False)))
+            toggle.connect("toggled", lambda b, eid=e["id"]: self.toggle_layer(eid, b.get_active()))
+            row.append(toggle)
+            self.effect_toggles[e["id"]] = toggle
             self.effect_rows[e["id"]] = (mark, use)
             box.append(row)
             box.append(rule())
@@ -859,17 +895,18 @@ class RainPanel(Gtk.Application):
             if on:
                 m += f'  <span foreground="{p["dim"]}">· active</span>'
             mark.set_markup(m)
-            use.set_label("[ active ]" if on else "[ use ]")
-            use.set_sensitive(not on)
+            use.set_label("[ controls ]")
+            use.set_sensitive(True)
 
     def set_effect(self, eid, load=True):
         if eid not in EFFECT:
             self.log("rain", f"no effect '{eid}' · " + ", ".join(EFFECT), "warn")
             return
         if eid == self.effect and load:
+            self.switch("control")
             return
         self.effect = eid
-        if load and self.online:
+        if load and self.online and not self.composable:
             cmd, path, installed = find_binary()
             target = str(REPO / "effects" / f"{eid}-effects" / f"{eid}.frag") if not installed else eid
             reply = ctl(f"load {target}")
@@ -1126,6 +1163,9 @@ class RainPanel(Gtk.Application):
             self.cmd(line)
 
     def cmd(self, line, echo=True):
+        if line.split()[0] in ("screen", "weather", "mode", "location", "transition", "profile", "override", "capabilities", "diagnostics"):
+            self.control_call(line, lambda reply: self.log("controller", json.dumps(reply), "err" if "error" in reply else "fg"))
+            return None
         reply = ctl(line)
         if reply is None:
             self.log("gl-overlay", "offline · type start", "warn")
@@ -1189,6 +1229,8 @@ class RainPanel(Gtk.Application):
             argv += ["-s", shader]
         argv += self.flags()
         self.log("rain", "start " + " ".join(shlex.quote(a) for a in argv[1:]), "dim")
+        self.replaying = True
+        self.startup_attempts = 0
         try:
             self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                          start_new_session=True)
@@ -1198,7 +1240,20 @@ class RainPanel(Gtk.Application):
         os.set_blocking(self.proc.stderr.fileno(), False)
         GLib.io_add_watch(self.proc.stderr.fileno(), GLib.PRIORITY_DEFAULT,
                           GLib.IOCondition.IN | GLib.IOCondition.HUP, self.on_stderr)
-        GLib.timeout_add(300, self.poll)
+        def replay():
+            self.poll()
+            if not self.online:
+                self.startup_attempts += 1
+                if self.proc and self.startup_attempts < 20: return True
+                self.replaying = False
+                return False
+            if self.composable:
+                ctl("base 0")
+                for eid,on in self.enabled.items():
+                    if on: self.toggle_layer(eid, True)
+            self.replaying = False
+            return False
+        GLib.timeout_add(300, replay)
 
     def on_stderr(self, fd, cond):
         try:
@@ -1244,15 +1299,27 @@ class RainPanel(Gtk.Application):
             self.save_prefs()
         # started elsewhere (e.g. from hyprland.lua with -s snow): follow the daemon's effect
         running = Path(self.status.get("shader", "")).stem
-        if online and running in EFFECT and running != self.effect:
+        if not self.composable and online and running in EFFECT and running != self.effect:
             self.set_effect(running, load=False)
             self.sync()
         self.refresh_daemon()
+        if self.online and self.composable and not getattr(self, "replaying", False):
+            try: self.sync_graph(json.loads(ctl("engine") or "{}"))
+            except (ValueError, KeyError): pass
+        if not self.control_pending and int(time_now := datetime.datetime.now().timestamp()) % 5 == 0:
+            self.control_call("status", self.show_control_status)
         return True
 
     def sync(self):
         """Read the daemon's live values into the steppers."""
-        got = kv(ctl("get"))
+        if self.composable:
+            try:
+                state = json.loads(ctl("engine") or "{}")
+                selected = next((layer for layer in state.get("layers", []) if layer["id"] == self.effect), None)
+                got = {k:str(v) for k,v in selected["params"].items()} if selected else {}
+            except (ValueError, KeyError): got = {}
+        else:
+            got = kv(ctl("get"))
         if "volume" in got and hasattr(self, "volume_stepper"):
             try:
                 self.globals["volume"] = float(got["volume"])
@@ -1272,7 +1339,7 @@ class RainPanel(Gtk.Application):
         s, p = self.status, self.p
         if self.online:
             self.stat["state"].set_markup(f'<span foreground="{p["ok"]}">ONLINE</span>')
-            self.stat["effect"].set_text(Path(s.get("shader", "")).stem or "?")
+            self.stat["effect"].set_text(self.effect if self.composable else (Path(s.get("shader", "")).stem or "?"))
             self.stat["outputs"].set_text(s.get("outputs", "?"))
             cap = s.get("fps_cap", "0")
             self.stat["fps"].set_text("max" if cap in ("0", "") else cap)
@@ -1297,7 +1364,10 @@ class RainPanel(Gtk.Application):
     def set_param(self, name, v, store):
         store[name] = v
         if self.online:
-            ctl(f"set {name} {v:g}")
+            if self.composable and name not in ("opacity", "volume"):
+                self.layer_command(self.effect, f"layer set {self.effect} {name} {v:g}")
+            else:
+                ctl(f"set {name} {v:g}")
         self.save_prefs()
         if hasattr(self, "snippet"):
             self.refresh_hypr()
@@ -1318,7 +1388,8 @@ class RainPanel(Gtk.Application):
             self.values[self.effect][k] = v
             self.steppers[k].set(v)
             if self.online:
-                ctl(f"set {k} {v:g}")
+                if self.composable: self.layer_command(self.effect, f"layer set {self.effect} {k} {v:g}")
+                else: ctl(f"set {k} {v:g}")
         if not vals and name == "defaults":
             self.globals["opacity"] = 1.0
             self.steppers["opacity"].set(1.0)
@@ -1327,6 +1398,163 @@ class RainPanel(Gtk.Application):
         self.save_prefs()
         self.refresh_hypr()
         self.log("rain", f"preset {name}" + ("" if self.online else " · applies on start"), "ok")
+
+    # ---- composable engine and optional controller
+    def sync_graph(self, state):
+        layers = {layer["id"]: layer for layer in state.get("layers", [])}
+        self.quiet += 1
+        try:
+            for eid, button in getattr(self, "effect_toggles", {}).items():
+                active = bool(layers.get(eid, {}).get("enabled", False))
+                self.enabled[eid] = active
+                button.set_active(active)
+        finally:
+            self.quiet -= 1
+        selected = layers.get(self.effect)
+        if not selected: return
+        for name,value in selected.get("params", {}).items():
+            if name in self.values[self.effect] and name in self.steppers:
+                self.values[self.effect][name] = value
+                self.steppers[name].set(value)
+        self.layer_values[self.effect]["layerOpacity"] = selected["opacity"]
+        if hasattr(self, "layer_opacity_stepper"):
+            self.layer_opacity_stepper.set(selected["opacity"])
+
+    def control_call(self, line, callback=None):
+        self.control_pending = True
+        future = self.control_pool.submit(controller_request, state_directory("RUNTIME") / "controller.sock", line)
+        def done():
+            self.control_pending = False
+            try:
+                reply = json.loads(future.result())
+                if callback: callback(reply)
+                elif "error" in reply: self.log("controller", reply["error"], "err")
+            except (OSError, ValueError) as exc:
+                if callback: callback({"error": str(exc)})
+                else: self.log("controller", str(exc) + " · start controller in environment", "warn")
+            return False
+        future.add_done_callback(lambda _: GLib.idle_add(done))
+
+    def layer_command(self, eid, command):
+        if self.control_status.get("mode"):
+            self.control_call(command)
+        else:
+            state = json.loads(ctl("engine") or "{}")
+            if eid not in {layer["id"] for layer in state.get("layers", [])}:
+                ctl(f"layer add {eid} {eid}")
+                ctl(f"layer enable {eid} {int(self.enabled.get(eid, False))}")
+            reply = ctl(command)
+            if reply and reply.startswith("error"): self.log("gl-overlay", reply, "err")
+
+    def toggle_layer(self, eid, on):
+        if self.quiet: return
+        self.composable = True
+        self.enabled[eid] = on
+        if self.online:
+            ctl("base 0")
+            if self.control_status.get("mode") and eid not in self.control_status.get("layers", {}):
+                self.control_call(f"layer add {eid} {eid}")
+            self.layer_command(eid, f"layer enable {eid} {int(on)}")
+            for name,value in self.values[eid].items():
+                self.layer_command(eid, f"layer set {eid} {name} {value:g}")
+        self.save_prefs()
+        self.build_params()
+
+    def set_layer_opacity(self, name, value, store):
+        store[name] = value
+        if self.online: self.layer_command(self.effect, f"layer opacity {self.effect} {value:g}")
+        self.save_prefs()
+
+    def start_controller(self):
+        path = HERE / "hyperion-cadere"
+        if path.exists(): command = [str(path), "serve"]
+        else: command = [sys.executable, str(REPO / "controller/hyperion-cadere.py"), "serve"]
+        subprocess.Popen(command, start_new_session=True)
+        GLib.timeout_add(600, lambda: (self.control_call("status", self.show_control_status), False)[1])
+
+    def entry_command(self, box, label_text, command, initial=""):
+        row = Gtk.Box(spacing=12)
+        row.append(lbl(label_text, "mid", width=130))
+        entry = Gtk.Entry(text=initial)
+        entry.set_hexpand(True)
+        row.append(entry)
+        row.append(btn("apply", lambda: self.control_call(command + " " + entry.get_text())))
+        box.append(row)
+        return entry
+
+    def build_environment(self):
+        box = vbox(18)
+        box.append(lbl("Optional weather/time controller. Location is explicit; no background geolocation. Open-Meteo refreshes every 15–30 minutes.", "prose", wrap=True))
+        box.append(btn("start controller", self.start_controller, "primary"))
+        self.mode_choice = Choice(self, ["manual", "automatic", "hybrid"], 0, lambda i: self.control_call("mode " + ["manual", "automatic", "hybrid"][i]))
+        box.append(self.mode_choice)
+        self.entry_command(box, "latitude longitude", "location", "")
+        self.entry_command(box, "transition seconds", "transition", "30")
+        self.entry_command(box, "refresh seconds", "weather interval", "1200")
+        self.entry_command(box, "hybrid override", "override", "screen.temperature 0.3")
+        box.append(btn("refresh weather", lambda: self.control_call("weather refresh")))
+        self.environment_status = lbl("controller offline", "small", "dim", wrap=True, sel=True)
+        box.append(self.environment_status)
+        return box
+
+    def build_screen(self):
+        box = vbox(18)
+        box.append(lbl("Native: real sampled grading, static grain and static refraction. Portable: approximate warmth/tint/vignette and animated translucent grain. Native animation is unavailable; damage tracking stays enabled.", "prose", wrap=True))
+        row = Gtk.Box(spacing=18)
+        for text,command in (("enable native", "screen enable"), ("portable", "screen portable"), ("off / restore", "screen disable"), ("take over existing shader", "screen claim replace")):
+            row.append(btn(text, lambda c=command: self.control_call(c)))
+        box.append(row)
+        self.screen_values = {k:v[2] for k,v in SCREEN_SPECS.items()}
+        self.screen_steppers = {}
+        for name,(lo,hi,default) in SCREEN_SPECS.items():
+            step = 1 if name in ("grain_size", "grain_mono") else (.001 if hi<=.15 else .01)
+            spec = (name, name.replace("_", " "), lo, hi, step, default, "native only" if name in ("saturation","contrast","exposure","gamma","refraction","frost","blur","haze") else "")
+            st = Stepper(self, spec, self.screen_values, self.set_screen_param)
+            self.screen_steppers[name] = st
+            box.append(st.widget)
+        return box
+
+    def set_screen_param(self, name, value, store):
+        store[name] = value
+        # Requests run in one worker and native regeneration is debounced by the service.
+        self.control_call(f"screen set {name} {value:g}")
+
+    def build_lighting(self):
+        box = vbox(18)
+        box.append(lbl("Sunbeams and flares use a virtual light source. Automatic mode infers its position from sunrise/sunset; it does not analyse desktop luminance.", "prose", wrap=True))
+        for eid in ("sunbeams", "lens-flare"):
+            box.append(btn(eid + " controls", lambda e=eid: (self.set_effect(e), self.switch("control"))))
+        box.append(lbl("Enable either effect in effects, then adjust origin, brightness, colour, ray softness or optical ghosts in control.", "small", "dim", wrap=True))
+        return box
+
+    def build_advanced(self):
+        box = vbox(18)
+        box.append(section("GPU quality", "low reduces viewport-backed buffer resolution"))
+        box.append(Choice(self, ["low", "balanced", "high"], 1, lambda i: self.cmd("quality " + ["low", "balanced", "high"][i])))
+        self.entry_command(box, "renderer command", "renderer", "outputs")
+        self.entry_command(box, "output assignment", "renderer", "layer output sakura DP-1")
+        self.entry_command(box, "output settings", "renderer", "output DP-1 fps 30")
+        self.entry_command(box, "profile name", "profile save", "desktop")
+        self.entry_command(box, "load profile", "profile load", "desktop")
+        self.entry_command(box, "merge profile", "profile merge", "desktop")
+        box.append(btn("backend diagnostics", lambda: self.control_call("status", self.show_control_status)))
+        self.backend_status = lbl("controller offline; standalone overlay remains available", "small", "dim", wrap=True, sel=True)
+        box.append(self.backend_status)
+        return box
+
+    def show_control_status(self, reply):
+        self.control_status = reply
+        if reply.get("mode") in ("manual", "automatic", "hybrid") and hasattr(self, "mode_choice"):
+            self.mode_choice.pick(["manual", "automatic", "hybrid"].index(reply["mode"]), notify=False)
+        if hasattr(self, "environment_status"):
+            info = {k:reply.get(k) for k in ("mode", "scene", "provider", "location", "timezone", "last_update", "stale", "condition", "refreshing", "error")}
+            self.environment_status.set_text(json.dumps(info, indent=2))
+        if hasattr(self, "backend_status"):
+            self.backend_status.set_text(json.dumps({"backend": reply.get("backend", reply), "renderer": reply.get("renderer")}, indent=2))
+        for name,value in reply.get("screen", {}).items():
+            if name in getattr(self, "screen_steppers", {}):
+                self.screen_values[name] = value
+                self.screen_steppers[name].set(value)
 
     # ---- hyprland
     def detect_config(self):

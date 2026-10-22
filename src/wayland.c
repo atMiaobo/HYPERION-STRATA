@@ -10,6 +10,8 @@
 #include <unistd.h>
 
 #include "overlay.h"
+#include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 static void output_create_surface(struct output *out);
@@ -22,9 +24,9 @@ static void output_destroy_surface(struct output *out);
 static double frame_wait(struct overlay *ov, struct output *out, double now)
 {
 	double wait = 0;
-	if (ov->min_frame_interval > 0)
-		wait = out->last_render + ov->min_frame_interval - now;
-	float step = ov->step_follow[0] ? param_get(ov, ov->step_follow, 0) : 0;
+	double interval = out->fps_override > 0 ? 1.0/out->fps_override : ov->min_frame_interval;
+    if (interval > 0) wait = out->last_render + interval - now;
+    float step = engine_step(ov, out->name);
 	if (step > 0 && !ov->paused && ov->last_frame > 0) {
 		double t = ov->time + (now - ov->last_frame);
 		double next = (floor(out->render_time * step) + 1) / step + 0.001;
@@ -50,8 +52,11 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
 				.it_value.tv_sec = (time_t)wait,
 				.it_value.tv_nsec = (long)((wait - (time_t)wait) * 1e9),
 			};
-			timerfd_settime(ov->timer_fd, 0, &its, NULL);
-			return;
+			struct itimerspec current;
+            timerfd_gettime(ov->timer_fd, &current);
+            double armed = current.it_value.tv_sec + current.it_value.tv_nsec*1e-9;
+            if (armed <= 0 || wait < armed) timerfd_settime(ov->timer_fd, 0, &its, NULL);
+            return;
 		}
 	}
 	output_render(ov, out);
@@ -124,6 +129,28 @@ void outputs_schedule_all(struct overlay *ov)
 
 /* ---------------------------------------------------------- layer surface */
 
+void output_resize_buffer(struct output *out) {
+    double scale = out->fractional && out->fractional_scale ? out->fractional_scale / 120.0 : out->scale;
+    if (out->viewport && out->ov->quality > 0 && out->ov->quality < 1) scale *= out->ov->quality;
+    out->buffer_width = (int)ceil(out->width * scale);
+    out->buffer_height = (int)ceil(out->height * scale);
+    if (out->buffer_width < 1) out->buffer_width = 1;
+    if (out->buffer_height < 1) out->buffer_height = 1;
+    if (out->viewport) {
+        wl_surface_set_buffer_scale(out->surface, 1);
+        if (out->width && out->height) wp_viewport_set_destination(out->viewport, out->width, out->height);
+    } else if (out->surface) wl_surface_set_buffer_scale(out->surface, out->scale);
+    if (out->egl_window) wl_egl_window_resize(out->egl_window, out->buffer_width, out->buffer_height, 0, 0);
+}
+static void fractional_preferred(void *data, struct wp_fractional_scale_v1 *scale, uint32_t preferred) {
+    struct output *out = data;
+    if (preferred < 30 || preferred > 960) return;
+    out->fractional_scale = preferred;
+    output_resize_buffer(out);
+    out->dirty = true; output_schedule(out);
+}
+static const struct wp_fractional_scale_v1_listener fractional_listener = { .preferred_scale = fractional_preferred };
+
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
                             uint32_t serial, uint32_t w, uint32_t h)
 {
@@ -134,7 +161,9 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
 	out->width = w;
 	out->height = h;
 
-	int bw = (int)w * out->scale, bh = (int)h * out->scale;
+	if (!w || !h) return;
+    output_resize_buffer(out);
+    int bw = out->buffer_width, bh = out->buffer_height;
 	if (!out->egl_window) {
 		out->egl_window = wl_egl_window_create(out->surface, bw, bh);
 		out->egl_surface = eglCreatePlatformWindowSurface(
@@ -178,6 +207,12 @@ static void output_create_surface(struct output *out)
 
 	out->surface = wl_compositor_create_surface(ov->compositor);
 	wl_surface_set_buffer_scale(out->surface, out->scale);
+    /* Clients draw in logical orientation. The compositor handles output transform. */
+    if (ov->viewporter) out->viewport = wp_viewporter_get_viewport(ov->viewporter, out->surface);
+    if (ov->fractional_manager && out->viewport) {
+        out->fractional = wp_fractional_scale_manager_v1_get_fractional_scale(ov->fractional_manager, out->surface);
+        wp_fractional_scale_v1_add_listener(out->fractional, &fractional_listener, out);
+    }
 
 	/*
 	 * Input passthrough. NOTE: set_input_region(NULL) means "infinite"
@@ -228,7 +263,10 @@ static void output_destroy_surface(struct output *out)
 		zwlr_layer_surface_v1_destroy(out->layer_surface);
 		out->layer_surface = NULL;
 	}
-	if (out->surface) {
+	if (out->fractional) { wp_fractional_scale_v1_destroy(out->fractional); out->fractional = NULL; }
+    if (out->viewport) { wp_viewport_destroy(out->viewport); out->viewport = NULL; }
+    out->waiting = false;
+    if (out->surface) {
 		wl_surface_destroy(out->surface);
 		out->surface = NULL;
 	}
@@ -250,10 +288,7 @@ static void output_scale(void *data, struct wl_output *o, int32_t scale)
 		return;
 	out->scale = scale;
 	if (out->surface) {
-		wl_surface_set_buffer_scale(out->surface, scale);
-		if (out->egl_window)
-			wl_egl_window_resize(out->egl_window, out->width * scale,
-			                     out->height * scale, 0, 0);
+		output_resize_buffer(out);
 		out->dirty = true;
 		output_schedule(out);
 	}
@@ -263,6 +298,11 @@ static void output_name(void *data, struct wl_output *o, const char *name)
 {
 	struct output *out = data;
 	snprintf(out->name, sizeof out->name, "%s", name);
+    for(int i=0;i<out->ov->n_output_rules;i++) {
+        struct output_rule *rule=&out->ov->output_rules[i];
+        if(strcmp(rule->name,name)) continue;
+        out->disabled=rule->disabled; out->output_opacity=rule->opacity; out->fps_override=rule->fps;
+    }
 }
 
 static void output_done(void *data, struct wl_output *o)
@@ -292,7 +332,11 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
 	} else if (strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) {
 		ov->layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
 		                                   version < 4 ? version : 4);
-	} else if (strcmp(iface, wl_output_interface.name) == 0) {
+	} else if (!strcmp(iface, wp_viewporter_interface.name)) {
+        ov->viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
+    } else if (!strcmp(iface, wp_fractional_scale_manager_v1_interface.name)) {
+        ov->fractional_manager = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
+    } else if (strcmp(iface, wl_output_interface.name) == 0) {
 		if (version < 4) {
 			fprintf(stderr, "gl-overlay: wl_output v%u too old (need 4)\n", version);
 			return;
@@ -301,6 +345,7 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
 		out->ov = ov;
 		out->global_name = name;
 		out->scale = 1;
+        out->output_opacity = 1;
 		out->wl_output = wl_registry_bind(reg, name, &wl_output_interface, 4);
 		wl_output_add_listener(out->wl_output, &output_listener, out);
 		wl_list_insert(&ov->outputs, &out->link);
@@ -371,7 +416,9 @@ void wl_destroy_outputs(struct overlay *ov)
 
 void wl_finish(struct overlay *ov)
 {
-	if (ov->layer_shell)
+	if (ov->viewporter) wp_viewporter_destroy(ov->viewporter);
+    if (ov->fractional_manager) wp_fractional_scale_manager_v1_destroy(ov->fractional_manager);
+    if (ov->layer_shell)
 		zwlr_layer_shell_v1_destroy(ov->layer_shell);
 	if (ov->compositor)
 		wl_compositor_destroy(ov->compositor);
